@@ -312,6 +312,7 @@ jobs:
           sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL)/set_nameidata(nd, old_dfd, fake_filename)/g' fs/namei.c
           echo "::endgroup::"
           echo "::endgroup::"
+          sed -i '1i #include <linux/security.h>' ../fs/susfs.c           
 
           DEFCONFIG="arch/arm64/configs/marble_defconfig"
           if [ -f "$DEFCONFIG" ]; then
