@@ -35,6 +35,10 @@ on:
         required: true
         type: boolean
         default: true
+      NOMOUNT_REF:
+        description: "NoMount commit/branch (leave empty for master)"
+        required: false
+        default: "master"
       ENABLE_REKERNEL:
         description: "Enable Re-Kernel (netlink & eBPF)"
         required: true
@@ -92,6 +96,7 @@ jobs:
       ENABLE_KSU: ${{ inputs.ENABLE_KERNELSU }}
       ENABLE_SUSFS: ${{ inputs.ENABLE_SUSFS }}
       ENABLE_NOMOUNT: ${{ inputs.ENABLE_NOMOUNT }}
+      NOMOUNT_REF: ${{ inputs.NOMOUNT_REF || 'master' }}
       ENABLE_REKERNEL: ${{ inputs.ENABLE_REKERNEL }}
       LTO: ${{ inputs.LTO_TYPE || 'thin' }}
       ENABLE_BBRV3: ${{ inputs.ENABLE_BBRV3 }}
@@ -336,8 +341,9 @@ jobs:
           cd kernel
           export KERNEL_SRC="$PWD"
 
-          echo "::group::Integrating NoMount"
-          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s master
+          NOMOUNT_REF="${{ inputs.NOMOUNT_REF || 'master' }}"
+          echo "::group::Integrating NoMount (ref: $NOMOUNT_REF)"
+          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_REF}/kernel/setup.sh" | bash -s "$NOMOUNT_REF"
           echo "::endgroup::"
 
           DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
@@ -367,7 +373,6 @@ jobs:
             }
           else
             echo "::warning::Re-Kernel integrate script not found, attempting manual file copy..."
-            # Copy eBPF source if available
             if [ -d "re-kernel-src/eBPF-Source" ]; then
               cp -r "re-kernel-src/eBPF-Source" ./re-kernel-ebpf
               echo "✓ eBPF-Source copied"
@@ -445,7 +450,6 @@ jobs:
 
           echo "::group::Downloading LLVM $LLVM_TAG"
           LLVM_VER=$(echo "$LLVM_TAG" | sed 's/^llvmorg-//' | cut -d'.' -f1)
-          # Download prebuilt LLVM for Linux x86_64
           LLVM_URL="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/clang+llvm-${LLVM_VER}.0.0-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
           curl -L -o llvm.tar.xz "$LLVM_URL" || {
             echo "::warning::Primary URL failed, trying generic Linux build..."
@@ -534,7 +538,6 @@ jobs:
 
           cp "$GITHUB_WORKSPACE/dist/Image" anykernel/Image
 
-          # Compute SHA1 of stock boot image if available, otherwise use empty
           IMAGE_SHA1=$(sha1sum "$GITHUB_WORKSPACE/dist/Image" | cut -d' ' -f1)
           echo "Image SHA1: $IMAGE_SHA1"
           sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" anykernel/anykernel.sh
@@ -597,7 +600,7 @@ jobs:
             | **Compiler** | ${{ env.CLANG_VER }} |
             | **Root Manager** | ${{ env.KSU_VER }} |
             | **SuSFS** | ${{ env.SUSFS_STATUS }} |
-            | **NoMount** | ${{ env.NOMOUNT_STATUS }} |
+            | **NoMount** | ${{ env.NOMOUNT_STATUS }} (ref: ${{ env.NOMOUNT_REF }}) |
             | **Re-Kernel** | ${{ env.REKERNEL_STATUS }} |
             | **Build** | #${{ github.run_number }} |
 
