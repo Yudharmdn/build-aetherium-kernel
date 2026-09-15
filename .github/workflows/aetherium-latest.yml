@@ -1,4 +1,4 @@
-name: Aetherium Latest
+name: Aetherium Marble Latest
 
 on:
   workflow_dispatch:
@@ -7,14 +7,6 @@ on:
         description: "Custom kernel name"
         required: true
         default: "Aetherium"
-      BASE_REPO:
-        description: "Base kernel repo (kaminarich/GKI-Kernel or any android12-5.10 GKI source)"
-        required: true
-        default: "https://github.com/kaminarich/GKI-Kernel.git"
-      BASE_BRANCH:
-        description: "Base repo branch"
-        required: true
-        default: "aetherium"
       UPSTREAM_TAG:
         description: "Google upstream tag to merge (leave empty to skip merge)"
         required: false
@@ -28,37 +20,26 @@ on:
           - "ours-auto"
           - "fail-on-conflict"
         default: "theirs-auto"
-      ENABLE_KERNELSU_NEXT:
-        description: "Enable KernelSU (Root)"
+      ENABLE_KERNELSU:
+        description: "Enable ReSukiSU (Root)"
         required: true
         type: boolean
         default: true
-      ROOT_MANAGER:
-        description: "Root Manager (KSU Fork)"
-        required: true
-        type: choice
-        options:
-          - "KernelSU-Next"
-          - "ReSukiSU"
-          - "SuKiSU-Ultra"
-        default: "KernelSU-Next"
       ENABLE_SUSFS:
-        description: "Patch SuSFS for KernelSU"
+        description: "Patch SuSFS for ReSukiSU"
         required: true
         type: boolean
         default: true
-      KSU_NEXT_BRANCH:
-        description: "KernelSU-Next branch"
-        required: false
-        default: "dev-susfs"
-      RESUKISU_BRANCH:
-        description: "ReSukiSU branch (kosongkan untuk default main)"
-        required: false
-        default: ""
-      SUKISU_BRANCH:
-        description: "SuKiSU-Ultra branch (kosongkan untuk default builtin/main)"
-        required: false
-        default: ""
+      ENABLE_NOMOUNT:
+        description: "Enable NoMount (VFS path injection)"
+        required: true
+        type: boolean
+        default: true
+      ENABLE_REKERNEL:
+        description: "Enable Re-Kernel (netlink & eBPF)"
+        required: true
+        type: boolean
+        default: true
       LTO_TYPE:
         description: "LTO type"
         required: false
@@ -96,20 +77,22 @@ on:
 
 jobs:
   build:
-    name: "${{ inputs.KERNEL_NAME }} | 5.10 | ${{ inputs.UPSTREAM_TAG || 'no-merge' }} | Neutron"
+    name: "${{ inputs.KERNEL_NAME }} | 5.10 | marble | ${{ inputs.UPSTREAM_TAG || 'no-merge' }} | LLVM"
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     env:
       KERNEL_NAME: ${{ inputs.KERNEL_NAME || 'Aetherium' }}
-      BASE_REPO: ${{ inputs.BASE_REPO }}
-      BASE_BRANCH: ${{ inputs.BASE_BRANCH || 'aetherium' }}
+      BASE_REPO: "https://github.com/yudharn/Pzqqt-Melt-Rebase"
+      BASE_BRANCH: "Yudharn-melt-rebase"
+      DEFCONFIG: "marble_defconfig"
       UPSTREAM_TAG: ${{ inputs.UPSTREAM_TAG }}
       MERGE_STRATEGY: ${{ inputs.MERGE_STRATEGY || 'theirs-auto' }}
-      ENABLE_KSU: ${{ inputs.ENABLE_KERNELSU_NEXT }}
-      ROOT_MANAGER: ${{ inputs.ROOT_MANAGER }}
+      ENABLE_KSU: ${{ inputs.ENABLE_KERNELSU }}
       ENABLE_SUSFS: ${{ inputs.ENABLE_SUSFS }}
+      ENABLE_NOMOUNT: ${{ inputs.ENABLE_NOMOUNT }}
+      ENABLE_REKERNEL: ${{ inputs.ENABLE_REKERNEL }}
       LTO: ${{ inputs.LTO_TYPE || 'thin' }}
       ENABLE_BBRV3: ${{ inputs.ENABLE_BBRV3 }}
       ENABLE_DROIDSPACES: ${{ inputs.ENABLE_DROIDSPACES }}
@@ -137,7 +120,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache curl flex git gnupg gperf \
             libelf-dev libncurses5-dev libssl-dev lz4 python3 \
-            python-is-python3 rsync zip unzip jq zstd
+            python-is-python3 rsync zip unzip jq zstd cpio
 
       - name: Setup swap
         run: |
@@ -246,134 +229,159 @@ jobs:
       # ──────────────────────────────────────────────
       - name: Set kernel name
         run: |
-          DEFCONFIG="kernel/arch/arm64/configs/gki_defconfig"
-          if [ -f "$DEFCONFIG" ]; then
-            sed -i '/^CONFIG_LOCALVERSION=/d' "$DEFCONFIG"
-            sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$DEFCONFIG"
-            echo "CONFIG_LOCALVERSION=\"-${KERNEL_NAME}\"" >> "$DEFCONFIG"
-            echo "CONFIG_LOCALVERSION_AUTO=n" >> "$DEFCONFIG"
+          DEFCONFIG_PATH="kernel/arch/arm64/configs/${DEFCONFIG}"
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            sed -i '/^CONFIG_LOCALVERSION=/d' "$DEFCONFIG_PATH"
+            sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$DEFCONFIG_PATH"
+            echo "CONFIG_LOCALVERSION=\"-${KERNEL_NAME}\"" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_LOCALVERSION_AUTO=n" >> "$DEFCONFIG_PATH"
             echo "✓ Kernel name: -$KERNEL_NAME"
+          else
+            echo "::error::Defconfig not found: $DEFCONFIG_PATH"
+            exit 1
           fi
 
       # ──────────────────────────────────────────────
-      # 4. Patch Root Manager & SuSFS
+      # 4. ReSukiSU Integration
       # ──────────────────────────────────────────────
-      - name: Patch Root Manager
+      - name: Patch ReSukiSU
+        if: inputs.ENABLE_KERNELSU == true
         run: |
-          echo "KSU_VER=Disabled" >> $GITHUB_ENV
-          echo "SUSFS_STATUS=Disabled" >> $GITHUB_ENV
+          cd kernel
+          export KERNEL_SRC="$PWD"
+          export ROOT_DIR="$GITHUB_WORKSPACE"
 
-          if [ "$ENABLE_KSU" = "true" ]; then
-            cd kernel
-            export KERNEL_SRC="$PWD"
-            export ROOT_DIR="$GITHUB_WORKSPACE"
-            export LUMINAIRE_PATCH_DIR="$GITHUB_WORKSPACE/luminaire_tools"
+          echo "::group::Integrating ReSukiSU"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main
+          echo "::endgroup::"
 
-            # 🛠️ Tambahan: Deklarasikan fungsi untuk resukisu.sh / sukisu.sh
-            function log() { echo "✅ $1"; }
-            export -f log
-            function error() { echo "❌ $1"; exit 1; }
-            export -f error
-            function warn() { echo "⚠️ $1"; }
-            export -f warn
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            echo "" >> "$DEFCONFIG_PATH"
+            echo "# ReSukiSU" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_MANUAL_SU=n" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_KPROBE_HOOKS=y" >> "$DEFCONFIG_PATH"
 
-            echo "::group::Integrating $ROOT_MANAGER"
-            
-            if [ "$ROOT_MANAGER" = "KernelSU-Next" ]; then
-              curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/${{ inputs.KSU_NEXT_BRANCH }}/kernel/setup.sh" | bash -s "${{ inputs.KSU_NEXT_BRANCH }}"
-              
-              DEFCONFIG="arch/arm64/configs/gki_defconfig"
-              if [ -f "$DEFCONFIG" ]; then
-                echo "" >> "$DEFCONFIG"
-                echo "# KernelSU" >> "$DEFCONFIG"
-                echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-                echo "CONFIG_KSU_MANUAL_SU=n" >> "$DEFCONFIG"
-                echo "CONFIG_KSU_KPROBE_HOOKS=y" >> "$DEFCONFIG"
-
-                echo "" >> "$DEFCONFIG"
-                echo "# Required for KSU" >> "$DEFCONFIG"
-                echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
-                echo "CONFIG_KPROBES=y" >> "$DEFCONFIG"
-                echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG"
-                echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG"
-                echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
-                echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
-                echo "✓ Root Manager configs added"
-              fi
-              echo "KSU_VER=$ROOT_MANAGER" >> $GITHUB_ENV
-
-            elif [ "$ROOT_MANAGER" = "ReSukiSU" ]; then
-              if [ -n "${{ inputs.RESUKISU_BRANCH }}" ]; then
-                export RESUKISU_REF="${{ inputs.RESUKISU_BRANCH }}"
-              fi
-              bash "$LUMINAIRE_PATCH_DIR/kernel/android14-6.1-lts/ksu/resukisu/resukisu.sh"
-
-            elif [ "$ROOT_MANAGER" = "SuKiSU-Ultra" ]; then
-              export SUSFS_ENABLED="$ENABLE_SUSFS"
-              if [ -n "${{ inputs.SUKISU_BRANCH }}" ]; then
-                export SUKISU_REF="${{ inputs.SUKISU_BRANCH }}"
-                export SUKISU_BUILTIN_REF="${{ inputs.SUKISU_BRANCH }}"
-              fi
-              bash "$LUMINAIRE_PATCH_DIR/kernel/android14-6.1-lts/ksu/sukisu/sukisu.sh"
-            fi
-            
-            echo "::endgroup::"
-
-            if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU" ]; then
-              echo "::error::Root Manager integration failed"
-              exit 1
-            fi
-            
-            # Set KSU_VER dari file script jika tersedia
-            if [ -z "$RESUKISU_VERSION_DISPLAY" ] && [ -z "$SUKISU_VERSION_DISPLAY" ]; then
-              echo "KSU_VER=$ROOT_MANAGER" >> $GITHUB_ENV
-            fi
-            cd ..
+            echo "" >> "$DEFCONFIG_PATH"
+            echo "# Required for KSU" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG_PATH"
+            echo "✓ ReSukiSU configs added"
           fi
+
+          echo "KSU_VER=ReSukiSU" >> $GITHUB_ENV
+
+          if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU" ]; then
+            echo "::error::ReSukiSU integration failed"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────────────
+      # 5. SuSFS Integration
+      # ──────────────────────────────────────────────
       - name: Patch SuSFS for 5.10
-        if: inputs.ENABLE_KERNELSU_NEXT == true && inputs.ENABLE_SUSFS == true
+        if: inputs.ENABLE_KERNELSU == true && inputs.ENABLE_SUSFS == true
         run: |
           cd kernel
 
           echo "::group::Integrating SuSFS for 5.10"
-          git clone https://gitlab.com/simonpunk/susfs4ksu/ -b gki-android12-5.10 sus
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 sus
           rm -rf sus/.git
           susfs="sus/kernel_patches"
           cp -r "$susfs/fs" .
           cp -r "$susfs/include" .
           cp -r "$susfs/50_add_susfs_in_gki-android12-5.10.patch" .
-          patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch || {
+          patch -p1 --batch < 50_add_susfs_in_gki-android12-5.10.patch || {
             echo "::warning::SuSFS patch had issues applying cleanly, some hunks may have failed or already been applied."
           }
 
-          # Fix set_nameidata arguments (some 5.10 kernels use 3 args instead of 4)
           echo "::group::Fixing set_nameidata in fs/namei.c"
           sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL)/set_nameidata(nd, old_dfd, fake_filename)/g' fs/namei.c
           echo "::endgroup::"
-
           echo "::endgroup::"
 
-          DEFCONFIG="arch/arm64/configs/gki_defconfig"
-          if [ -f "$DEFCONFIG" ]; then
-            echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG_PATH"
             echo "✓ SuSFS configs added"
           fi
 
           echo "SUSFS_STATUS=Enabled" >> $GITHUB_ENV
 
       - name: Fix susfs statfs forward declarations
-        if: inputs.ENABLE_KERNELSU_NEXT == true && inputs.ENABLE_SUSFS == true
+        if: inputs.ENABLE_KERNELSU == true && inputs.ENABLE_SUSFS == true
         run: bash "$GITHUB_WORKSPACE/scripts/fix-susfs-statfs.sh"
         working-directory: kernel
+
+      # ──────────────────────────────────────────────
+      # 6. NoMount Integration
+      # ──────────────────────────────────────────────
+      - name: Patch NoMount
+        if: inputs.ENABLE_NOMOUNT == true
+        run: |
+          cd kernel
+          export KERNEL_SRC="$PWD"
+
+          echo "::group::Integrating NoMount"
+          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s master
+          echo "::endgroup::"
+
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            echo "CONFIG_NOMOUNT=y" >> "$DEFCONFIG_PATH"
+            echo "✓ NoMount config added"
+          fi
+          echo "NOMOUNT_STATUS=Enabled" >> $GITHUB_ENV
+
+      # ──────────────────────────────────────────────
+      # 7. Re-Kernel Integration (Netlink & eBPF)
+      # ──────────────────────────────────────────────
+      - name: Patch Re-Kernel
+        if: inputs.ENABLE_REKERNEL == true
+        run: |
+          cd kernel
+          export KERNEL_SRC="$PWD"
+
+          echo "::group::Cloning Re-Kernel"
+          git clone --depth=1 https://github.com/Sakion-Team/Re-Kernel.git re-kernel-src
+          echo "::endgroup::"
+
+          echo "::group::Applying Re-Kernel netlink & eBPF patches"
+          if [ -f "re-kernel-src/Integrate/apply.sh" ]; then
+            bash "re-kernel-src/Integrate/apply.sh" || {
+              echo "::warning::Re-Kernel integrate script had issues, attempting manual patch..."
+            }
+          else
+            echo "::warning::Re-Kernel integrate script not found, attempting manual file copy..."
+            # Copy eBPF source if available
+            if [ -d "re-kernel-src/eBPF-Source" ]; then
+              cp -r "re-kernel-src/eBPF-Source" ./re-kernel-ebpf
+              echo "✓ eBPF-Source copied"
+            fi
+          fi
+          echo "::endgroup::"
+
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            echo "CONFIG_RE_KERNEL=y" >> "$DEFCONFIG_PATH"
+            echo "CONFIG_RE_KERNEL_EBPF=y" >> "$DEFCONFIG_PATH"
+            echo "✓ Re-Kernel configs added"
+          fi
+          echo "REKERNEL_STATUS=Enabled" >> $GITHUB_ENV
 
       # ──────────────────────────────────────────────
       # X. Apply Optimization Addons
@@ -385,25 +393,20 @@ jobs:
           export KERNEL_VERSION="5.10"
           export LUMINAIRE_PATCH_DIR="$GITHUB_WORKSPACE"
           export ROOT_DIR="$GITHUB_WORKSPACE"
-          
+
           echo "::group::Mempersiapkan Lingkungan Addons secara Otomatis"
-          # 1. Update hardcoded paths dari kernel/ ke add-on/
           find "$GITHUB_WORKSPACE/add-on/addons" -type f -name "*.sh" -exec sed -i 's|/kernel/addons/|/add-on/addons/|g' {} +
           find "$GITHUB_WORKSPACE/add-on/addons" -type f -name "*.sh" -exec sed -i 's|/kernel/patches/|/add-on/patches/|g' {} +
-          
-          # 2. Hancurkan backtick nyasar di droidspaces.sh
+
           sed -i 's/^KABI_PATCH=.*/KABI_PATCH="$LUMINAIRE_PATCH_DIR\/add-on\/patches\/001_GKI-below-6_12-fix_sysvipc_kabi_6_7_8.patch"/g' "$GITHUB_WORKSPACE/add-on/addons/droidspaces/droidspaces.sh" 2>/dev/null || true
-          
-          # 3. FIX HARDCODE 6.1 DI LZ4KD.SH! Ubah 6.1 menjadi versi kernel aktual yang dibuild
+
           sed -i 's|/zram_patch/6.1/|/zram_patch/${KERNEL_VERSION}/|g' "$GITHUB_WORKSPACE/add-on/addons/lz4kd/lz4kd.sh" 2>/dev/null || true
-          
-          # 4. Mencegah infinite hang: Paksa semua curl agar timeout maksimal 15 detik
+
           find "$GITHUB_WORKSPACE/add-on/addons" -type f -name "*.sh" -exec sed -i 's/curl -LSs /curl -LSs -m 15 /g' {} +
-          
-          # 5. Mencegah stuck: Paksa semua command patch memakai --batch
+
           find "$GITHUB_WORKSPACE/add-on/addons" -type f -name "*.sh" -exec sed -i 's/patch -p1/patch -p1 --batch/g' {} +
           echo "::endgroup::"
-          
+
           function log() { echo "✅ $1"; }
           export -f log
           function error() { echo "❌ $1"; exit 1; }
@@ -428,19 +431,34 @@ jobs:
           fi
 
       # ──────────────────────────────────────────────
-      # 5. Download toolchain & Build
+      # 8. Download latest LLVM toolchain & Build
       # ──────────────────────────────────────────────
-      - name: Download Neutron Clang toolchain
+      - name: Download latest LLVM Clang toolchain
         run: |
-          echo "::group::Downloading Neutron Clang (via antman)"
-          git clone https://github.com/Neutron-Toolchains/antman --depth=1 "$GITHUB_WORKSPACE/toolchain"
-          cd "$GITHUB_WORKSPACE/toolchain"
-          ./antman -S
+          echo "::group::Fetching latest LLVM release tag"
+          LLVM_TAG=$(curl -s -L -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/llvm/llvm-project/releases/latest | jq -r '.tag_name')
+          echo "Latest LLVM tag: $LLVM_TAG"
+          echo "LLVM_TAG=$LLVM_TAG" >> $GITHUB_ENV
           echo "::endgroup::"
+
+          echo "::group::Downloading LLVM $LLVM_TAG"
+          LLVM_VER=$(echo "$LLVM_TAG" | sed 's/^llvmorg-//' | cut -d'.' -f1)
+          # Download prebuilt LLVM for Linux x86_64
+          LLVM_URL="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/clang+llvm-${LLVM_VER}.0.0-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+          curl -L -o llvm.tar.xz "$LLVM_URL" || {
+            echo "::warning::Primary URL failed, trying generic Linux build..."
+            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/LLVM-${LLVM_VER}.0.0-Linux-X64.tar.xz"
+            curl -L -o llvm.tar.xz "$LLVM_URL"
+          }
+          mkdir -p "$GITHUB_WORKSPACE/toolchain"
+          tar -xf llvm.tar.xz -C "$GITHUB_WORKSPACE/toolchain" --strip-components=1
+          echo "::endgroup::"
+
           echo "Clang version:"
           "$GITHUB_WORKSPACE/toolchain/bin/clang" --version | head -2
-
-          echo "CLANG_VER=Neutron Clang" >> $GITHUB_ENV
+          echo "CLANG_VER=LLVM $LLVM_TAG" >> $GITHUB_ENV
 
       - name: Build kernel
         run: |
@@ -453,13 +471,11 @@ jobs:
           export LLVM_IAS=1
           export CROSS_COMPILE=aarch64-linux-gnu-
 
-          # Stamp the version banner (Linux version ... user@host ...)
-          # with Aetherium builder identity instead of the runner default.
           export KBUILD_BUILD_USER="aetherium"
           export KBUILD_BUILD_HOST="kaminarich"
 
-          echo "::group::Configuring (gki_defconfig)"
-          make O=out gki_defconfig
+          echo "::group::Configuring (${DEFCONFIG})"
+          make O=out ${DEFCONFIG}
           echo "::endgroup::"
 
           case "$LTO" in
@@ -489,13 +505,11 @@ jobs:
           }
           echo "::endgroup::"
 
-          # Copy output
           cp out/arch/arm64/boot/Image* "$GITHUB_WORKSPACE/dist/" 2>/dev/null || true
 
           echo "── Build output ──"
           ls -lh "$GITHUB_WORKSPACE/dist/"
 
-          # Extract kernel version dynamically
           if [ -f out/include/generated/utsrelease.h ]; then
             KVER=$(grep UTS_RELEASE out/include/generated/utsrelease.h | cut -d'"' -f2)
             echo "Kernel version: $KVER"
@@ -505,13 +519,13 @@ jobs:
           fi
 
       # ──────────────────────────────────────────────
-      # 6. Package with AnyKernel3 (AetheriumAnykernel)
+      # 9. Package with AnyKernel3 (yudharn/AnyKernel3)
       # ──────────────────────────────────────────────
       - name: Package with AnyKernel3
         id: artifacts
         run: |
-          echo "::group::Packaging with AetheriumAnykernel (branch: gki)"
-          git clone --depth=1 -b gki https://github.com/kaminarich/AetheriumAnykernel.git anykernel
+          echo "::group::Packaging with yudharn/AnyKernel3"
+          git clone --depth=1 https://github.com/yudharn/AnyKernel3.git anykernel
 
           if [ ! -f "$GITHUB_WORKSPACE/dist/Image" ]; then
             echo "::error::Image not found, cannot pack AnyKernel3"
@@ -520,23 +534,27 @@ jobs:
 
           cp "$GITHUB_WORKSPACE/dist/Image" anykernel/Image
 
+          # Compute SHA1 of stock boot image if available, otherwise use empty
+          IMAGE_SHA1=$(sha1sum "$GITHUB_WORKSPACE/dist/Image" | cut -d' ' -f1)
+          echo "Image SHA1: $IMAGE_SHA1"
+          sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" anykernel/anykernel.sh
+
           KSU_TAG=""
           if [ "$ENABLE_KSU" = "true" ]; then
-            if [ "$ROOT_MANAGER" = "KernelSU-Next" ]; then
-              KSU_TAG="-KSU-Next"
-            elif [ "$ROOT_MANAGER" = "ReSukiSU" ]; then
-              KSU_TAG="-ReSukiSU"
-            elif [ "$ROOT_MANAGER" = "SuKiSU-Ultra" ]; then
-              KSU_TAG="-SuKiSU"
-            fi
-            
+            KSU_TAG="-ReSukiSU"
             if [ "$ENABLE_SUSFS" = "true" ]; then
               KSU_TAG="${KSU_TAG}-SuSFS"
             fi
           fi
+          if [ "$ENABLE_NOMOUNT" = "true" ]; then
+            KSU_TAG="${KSU_TAG}-NoMount"
+          fi
+          if [ "$ENABLE_REKERNEL" = "true" ]; then
+            KSU_TAG="${KSU_TAG}-ReKernel"
+          fi
 
           UPSTREAM_LABEL="${UPSTREAM_TAG:-base-only}"
-          BUILD_NAME="${KERNEL_NAME}-5.10-${UPSTREAM_LABEL}${KSU_TAG}-Neutron"
+          BUILD_NAME="${KERNEL_NAME}-marble-5.10-${UPSTREAM_LABEL}${KSU_TAG}-LLVM"
           DATE_TAG=$(date +%Y%m%d)
           ZIP_NAME="${BUILD_NAME}-${DATE_TAG}-${GITHUB_RUN_NUMBER}"
 
@@ -550,7 +568,7 @@ jobs:
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────
-      # 7. Upload & Release to GitHub
+      # 10. Upload & Release to GitHub
       # ──────────────────────────────────────────────
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -567,96 +585,27 @@ jobs:
           tag_name: ${{ steps.artifacts.outputs.release_tag }}
           name: "${{ steps.artifacts.outputs.build_name }}"
           body: |
-            ## 🔧 ${{ inputs.KERNEL_NAME }} — Android 5.10 GKI Kernel
+            ## 🔧 ${{ inputs.KERNEL_NAME }} — Poco F5 (marble) 5.10 Kernel
 
             | Property | Value |
             |----------|-------|
             | **Kernel** | ${{ env.KVER }} |
-            | **Base Source** | [${{ inputs.BASE_BRANCH }}](<${{ inputs.BASE_REPO }}>) |
+            | **Device** | Poco F5 (marble) |
+            | **Base Source** | [Yudharn-melt-rebase](https://github.com/yudharn/Pzqqt-Melt-Rebase) |
+            | **Defconfig** | ${{ env.DEFCONFIG }} |
             | **Upstream Merged** | ${{ inputs.UPSTREAM_TAG || 'none' }} |
             | **Compiler** | ${{ env.CLANG_VER }} |
             | **Root Manager** | ${{ env.KSU_VER }} |
             | **SuSFS** | ${{ env.SUSFS_STATUS }} |
+            | **NoMount** | ${{ env.NOMOUNT_STATUS }} |
+            | **Re-Kernel** | ${{ env.REKERNEL_STATUS }} |
             | **Build** | #${{ github.run_number }} |
 
             ### 📥 Flash
             1. Download zip below
-            2. Flash via **TWRP / EXKM / FKM** atau KernelSU Manager.
+            2. Flash via **TWRP / EXKM / FKM** or ReSukiSU Manager.
             3. Reboot
           files: |
             ${{ github.workspace }}/dist/${{ env.ZIP_NAME }}.zip
           draft: false
           prerelease: false
-
-      # ──────────────────────────────────────────────
-      # 8. Send to Telegram
-      # ──────────────────────────────────────────────
-      - name: Send to Telegram
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "Telegram tokens not set. Skipping upload to Telegram."
-            exit 0
-          fi
-
-          echo "Sending ZIP to Telegram..."
-
-          if [ -n "$RESUKISU_VERSION_DISPLAY" ]; then
-            FINAL_KSU_VER="ReSukiSU $RESUKISU_VERSION_DISPLAY"
-          elif [ -n "$SUKISU_VERSION_DISPLAY" ]; then
-            FINAL_KSU_VER="SuKiSU-Ultra $SUKISU_VERSION_DISPLAY"
-          else
-            FINAL_KSU_VER="${{ env.KSU_VER }}"
-          fi
-
-          CAPTION="Build Completed
-          Kernel Version: ${{ env.KVER }}
-          Compiler: ${{ env.CLANG_VER }}
-          Root Manager: $FINAL_KSU_VER
-          SuSFS: ${{ env.SUSFS_STATUS }}
-          LTO: ${{ inputs.LTO_TYPE }}"
-
-          curl -F document=@"${{ github.workspace }}/dist/${{ env.ZIP_NAME }}.zip" \
-               -F caption="$CAPTION" \
-               "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument?chat_id=${TG_CHAT_ID}"
-
-      # ──────────────────────────────────────────────
-      # 9. Send Error to Telegram (On Failure)
-      # ──────────────────────────────────────────────
-      - name: Send Error Log to Telegram
-        if: failure()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "Telegram tokens not set."
-            exit 0
-          fi
-
-          echo "Build Failed! Sending log to Telegram..."
-
-          ERROR_LOG="error_log.txt"
-          if [ -f kernel/build.log ]; then
-            echo "=== LAST 150 LINES OF LOG ===" > $ERROR_LOG
-            tail -n 150 kernel/build.log >> $ERROR_LOG
-            echo "" >> $ERROR_LOG
-            echo "=== FILTERED ERRORS ===" >> $ERROR_LOG
-            grep -iE "error:|warning:|undefined reference" kernel/build.log | tail -n 50 >> $ERROR_LOG
-          else
-            echo "Log file not found. Error happened before compilation." > $ERROR_LOG
-          fi
-
-          CAPTION="🚨 <b>BUILD FAILED!</b> 🚨
-          <b>Kernel:</b> ${{ inputs.KERNEL_NAME }} (5.10)
-          <b>Compiler:</b> ${{ env.CLANG_VER }}
-          <b>Upstream:</b> ${{ inputs.UPSTREAM_TAG || 'none' }}
-          <b>Action:</b> <a href=\"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\">View Action Logs</a>"
-
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-            -F chat_id="${TG_CHAT_ID}" \
-            -F document=@"$ERROR_LOG" \
-            -F caption="$CAPTION" \
-            -F parse_mode="HTML"
