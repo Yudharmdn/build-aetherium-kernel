@@ -1,0 +1,337 @@
+name: Build Kernel - Poco F5 (marble)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nomount_commit:
+        description: 'Custom commit/tag for NoMount (kosongkan untuk default master)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  build:
+    name: Build Kernel Marble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. Maximize Build Space
+      # ─────────────────────────────────────────────
+      - name: Maximize build space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      # ─────────────────────────────────────────────
+      # 2. Install Dependencies
+      # ─────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc curl git zip unzip ftp wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libssl-dev libfl-dev python3 python-is-python3 \
+            libarchive-tools cpio jq bison flex rsync \
+            libelf-dev libncurses-dev
+
+      # ─────────────────────────────────────────────
+      # 3. Clone Kernel Source
+      # ─────────────────────────────────────────────
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b Yudharn-melt-rebase \
+            https://github.com/yudharn/Pzqqt-Melt-Rebase.git kernel
+          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────────
+      # 4. Setup Clang LLVM (Latest Release)
+      # ─────────────────────────────────────────────
+      - name: Setup Clang LLVM (Latest)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+
+          echo "==> Fetching latest LLVM release info..."
+          RELEASE_JSON=$(curl -sL https://api.github.com/repos/llvm/llvm-project/releases/latest)
+          RELEASE_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          echo "LLVM Release: $RELEASE_TAG"
+
+          # Try LLVM-*-Linux-X64.tar.xz pattern first (modern naming)
+          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '
+            .assets[]
+            | select(.name | test("^LLVM-.*-Linux-X64\\.tar\\.xz$"))
+            | .browser_download_url
+          ' | head -1)
+
+          # Fallback to clang+llvm-*-x86_64-linux-* pattern (legacy naming)
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '
+              .assets[]
+              | select(.name | test("^clang\\+llvm-.*x86_64.*linux.*\\.tar\\.xz$"))
+              | .browser_download_url
+            ' | head -1)
+          fi
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "ERROR: Could not find suitable LLVM binary asset!"
+            exit 1
+          fi
+
+          echo "Download URL: $DOWNLOAD_URL"
+          wget -q --show-progress "$DOWNLOAD_URL" -O llvm.tar.xz
+          tar -xf llvm.tar.xz -C "$GITHUB_WORKSPACE/clang" --strip-components=1
+          rm -f llvm.tar.xz
+
+          echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+          echo "CLANG_DIR=$GITHUB_WORKSPACE/clang" >> $GITHUB_ENV
+          echo "LLVM_VERSION=$RELEASE_TAG" >> $GITHUB_ENV
+
+          # Verify
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version
+
+      # ─────────────────────────────────────────────
+      # 5. Setup KernelSU with ReSukiSU
+      # ─────────────────────────────────────────────
+      - name: Setup KernelSU (ReSukiSU)
+        working-directory: kernel
+        run: |
+          echo "==> Setting up KernelSU via ReSukiSU..."
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s
+          echo "KernelSU (ReSukiSU) setup complete."
+          # Verify
+          [ -d "KernelSU" ] && echo "KernelSU directory exists" || echo "WARNING: KernelSU directory not found"
+          [ -d "drivers/kernelsu" ] || [ -L "drivers/kernelsu" ] && echo "KernelSU driver linked" || echo "WARNING: KernelSU driver link not found"
+
+      # ─────────────────────────────────────────────
+      # 6. Setup SUSFS
+      # ─────────────────────────────────────────────
+      - name: Setup SUSFS
+        working-directory: kernel
+        run: |
+          echo "==> Cloning SUSFS for gki-android12-5.10..."
+          git clone --depth=1 -b gki-android12-5.10 \
+            https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu"
+
+          echo "==> Copying SUSFS kernel source files..."
+          # Copy fs/susfs source
+          cp -rv "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/"* fs/
+          # Copy include/linux headers
+          cp -rv "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/"* include/
+
+          echo "==> Applying SUSFS kernel patch..."
+          patch -p1 < "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch" || \
+            git apply "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch" || \
+            echo "WARNING: SUSFS kernel patch may need manual review"
+
+          echo "==> Applying SUSFS KernelSU patch..."
+          cd KernelSU
+          patch -p1 < "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || \
+            git apply "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || \
+            echo "WARNING: SUSFS KSU patch may need manual review"
+          cd ..
+
+          echo "SUSFS setup complete."
+
+      # ─────────────────────────────────────────────
+      # 7. Setup NoMount
+      # ─────────────────────────────────────────────
+      - name: Setup NoMount
+        working-directory: kernel
+        run: |
+          NOMOUNT_REF="${{ github.event.inputs.nomount_commit }}"
+          if [ -z "$NOMOUNT_REF" ]; then
+            NOMOUNT_REF="master"
+          fi
+          echo "==> Setting up NoMount with ref: $NOMOUNT_REF"
+          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s "$NOMOUNT_REF"
+          echo "NoMount setup complete (ref: $NOMOUNT_REF)."
+
+      # ─────────────────────────────────────────────
+      # 8. Setup ReKernel (Netlink & eBPF)
+      # ─────────────────────────────────────────────
+      - name: Setup ReKernel (Netlink & eBPF)
+        working-directory: kernel
+        run: |
+          echo "==> Cloning Re-Kernel..."
+          git clone --depth=1 https://github.com/Sakion-Team/Re-Kernel.git "$GITHUB_WORKSPACE/rekernel"
+
+          echo "==> Running ReKernel integration patches..."
+          bash "$GITHUB_WORKSPACE/rekernel/Integrate/patches.sh"
+
+          echo "ReKernel (Netlink & eBPF) setup complete."
+
+      # ─────────────────────────────────────────────
+      # 9. Enable configs in defconfig
+      # ─────────────────────────────────────────────
+      - name: Update defconfig
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/marble_defconfig"
+
+          # Enable SUSFS configs if not already present
+          if ! grep -q "CONFIG_KSU_SUSFS" "$DEFCONFIG"; then
+            cat >> "$DEFCONFIG" << 'EOF'
+
+          # SUSFS
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          EOF
+          fi
+
+          # Enable NoMount if not already present
+          if ! grep -q "CONFIG_NOMOUNT" "$DEFCONFIG"; then
+            cat >> "$DEFCONFIG" << 'EOF'
+
+          # NoMount
+          CONFIG_NOMOUNT=y
+          EOF
+          fi
+
+          echo "Defconfig updated."
+
+      # ─────────────────────────────────────────────
+      # 10. Build Kernel
+      # ─────────────────────────────────────────────
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          echo "==> Generating defconfig..."
+          make O=out ARCH=arm64 marble_defconfig
+
+          echo "==> Starting kernel build..."
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            2>&1 | tee build.log
+
+          echo "==> Build completed."
+
+          # Check for kernel image
+          if [ -f "out/arch/arm64/boot/Image" ]; then
+            echo "IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
+            echo "Kernel Image found."
+          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            echo "IMAGE=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
+            echo "Kernel Image.gz found."
+          elif [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
+            echo "Kernel Image.gz-dtb found."
+          else
+            echo "ERROR: No kernel image found!"
+            ls -la out/arch/arm64/boot/ || true
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────
+      # 11. Package with AnyKernel3
+      # ─────────────────────────────────────────────
+      - name: Package with AnyKernel3
+        run: |
+          echo "==> Cloning AnyKernel3..."
+          git clone --depth=1 https://github.com/yudharn/AnyKernel3.git
+
+          # Copy kernel image
+          cp "$KERNEL_DIR/$IMAGE" AnyKernel3/
+
+          # Calculate SHA1 and update anykernel.sh
+          IMAGE_SHA1=$(sha1sum "$KERNEL_DIR/$IMAGE" | awk '{print $1}')
+          echo "Image SHA1: $IMAGE_SHA1"
+          sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" AnyKernel3/anykernel.sh
+
+          # Copy DTBs if they exist
+          if [ -d "$KERNEL_DIR/out/arch/arm64/boot/dts" ]; then
+            find "$KERNEL_DIR/out/arch/arm64/boot/dts" -name "*.dtb" -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+          fi
+          if [ -f "$KERNEL_DIR/out/arch/arm64/boot/dtbo.img" ]; then
+            cp "$KERNEL_DIR/out/arch/arm64/boot/dtbo.img" AnyKernel3/
+          fi
+
+          # Create flashable zip
+          DATE=$(date +"%Y%m%d-%H%M")
+          ZIP_NAME="Marble-ReSukiSU-SUSFS-NoMount-ReKernel-${DATE}.zip"
+          cd AnyKernel3
+          zip -r9 "../$ZIP_NAME" . -x '.git*' 'README.md' 'LICENSE' '*.bak'
+          cd ..
+
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "==> Flashable zip created: $ZIP_NAME"
+
+      # ─────────────────────────────────────────────
+      # 12. Generate Build Info
+      # ─────────────────────────────────────────────
+      - name: Generate build info
+        run: |
+          NOMOUNT_REF="${{ github.event.inputs.nomount_commit }}"
+          if [ -z "$NOMOUNT_REF" ]; then
+            NOMOUNT_REF="master (default)"
+          fi
+
+          echo "## Build Info" > build_info.txt
+          echo "- **Device:** Poco F5 (marble)" >> build_info.txt
+          echo "- **Kernel Source:** yudharn/Pzqqt-Melt-Rebase @ Yudharn-melt-rebase" >> build_info.txt
+          echo "- **Defconfig:** marble_defconfig" >> build_info.txt
+          echo "- **LLVM Version:** $LLVM_VERSION" >> build_info.txt
+          echo "- **KernelSU:** ReSukiSU" >> build_info.txt
+          echo "- **SUSFS:** gki-android12-5.10" >> build_info.txt
+          echo "- **NoMount ref:** $NOMOUNT_REF" >> build_info.txt
+          echo "- **ReKernel:** Netlink & eBPF" >> build_info.txt
+          echo "- **Build Date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> build_info.txt
+
+          cat build_info.txt
+
+      # ─────────────────────────────────────────────
+      # 13. Upload Artifacts
+      # ─────────────────────────────────────────────
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel/build.log
+
+      - name: Upload build info
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: build_info.txt
+          
