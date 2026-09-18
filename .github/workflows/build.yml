@@ -1,90 +1,60 @@
-name: 🚀 Build Kernel — Poco F5 (marble)
+name: Build Kernel Poco F5
 
 on:
   workflow_dispatch:
     inputs:
       kernel_name:
-        description: "📛 Nama Kernel (untuk zip)"
+        description: "Nama Kernel"
         required: false
         default: "Yudharn-Melt"
       defconfig:
-        description: "⚙️ Defconfig"
+        description: "Defconfig"
         required: false
         default: "marble_defconfig"
       nomount_commit:
-        description: "🪝 NoMount — commit / branch / tag"
+        description: "NoMount commit/branch/tag (contoh: master, v1.0, abc1234)"
         required: false
         default: "master"
       susfs_branch:
-        description: "🛡️ Susfs branch"
+        description: "Susfs branch"
         required: false
         default: "gki-android12-5.10"
       resukisu_branch:
-        description: "🧩 ReSukiSU branch (main / dev / tag)"
+        description: "ReSukiSU branch"
         required: false
         default: "main"
       rekernel_branch:
-        description: "🔗 Re-Kernel (Sakion) branch"
+        description: "Re-Kernel branch"
         required: false
         default: "main"
-      clang_vendor:
-        description: "🛠️ Clang vendor (null = auto ambil dari LLVM latest)"
-        required: false
-        default: "null"
-      android_clang_version:
-        description: "📦 Versi Android prebuilt clang (jika clang_vendor = aosp)"
-        required: false
-        default: "r530567"
       clean_build:
-        description: "🧹 Bersihkan output sebelum build?"
-        type: choice
+        description: "Bersihkan sebelum build?"
         required: false
         default: "true"
-        options:
-          - "true"
-          - "false"
-      upload_anykernel3:
-        description: "📦 Upload AnyKernel3 zip?"
-        type: choice
-        required: false
-        default: "true"
-        options:
-          - "true"
-          - "false"
 
   push:
-    branches:
-      - Yudharn-melt-rebase
-    paths-ignore:
-      - "**.md"
-      - ".github/**"
+    branches: [ Yudharn-melt-rebase ]
 
 jobs:
   build:
-    name: 🔨 Build (${{ matrix.target }})
+    name: Build
     runs-on: ubuntu-22.04
     timeout-minutes: 360
-
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [clang]
-        include:
-          - target: clang
+    permissions:
+      contents: write
 
     env:
       KERNEL_DIR: ${{ github.workspace }}/kernel
       TOOLCHAIN_DIR: ${{ github.workspace }}/toolchain
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 5G
       KERNEL_NAME: ${{ github.event.inputs.kernel_name || 'Yudharn-Melt' }}
       DEFCONFIG: ${{ github.event.inputs.defconfig || 'marble_defconfig' }}
 
     steps:
-      # ============================================================
-      # 1. CHECKOUT SOURCE
-      # ============================================================
-      - name: 📥 Checkout kernel source
+      # -------------------------------------------------------
+      # 1. CHECKOUT
+      # -------------------------------------------------------
+      - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
           ref: Yudharn-melt-rebase
@@ -92,10 +62,10 @@ jobs:
           fetch-depth: 0
           path: kernel
 
-      # ============================================================
-      # 2. SETUP SYSTEM
-      # ============================================================
-      - name: 🐧 Setup Ubuntu environment
+      # -------------------------------------------------------
+      # 2. SYSTEM DEPS
+      # -------------------------------------------------------
+      - name: Install system packages
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
@@ -103,256 +73,229 @@ jobs:
             device-tree-compiler flex g++-multilib gcc-multilib git \
             gnupg gperf imagemagick jq kmod lib32readline-dev lib32z1-dev \
             libelf-dev liblz4-tool libsdl1.2-dev libssl-dev libxml2 \
-            libxml2-utils linux-libc-dev lz4 lzop openssh-client pngcrush \
-            python-is-python3 python2 python3 rsync schedtool squashfs-tools \
+            libxml2-utils lz4 lzop openssh-client pngcrush \
+            python-is-python3 python3 rsync schedtool squashfs-tools \
             texinfo u-boot-tools unzip wget xsltproc yasm zip zlib1g-dev
-          echo "✅ System packages installed"
 
-      # ============================================================
-      # 3. CLANG / LLVM — AUTO FETCH LATEST
-      # ============================================================
-      - name: 🔍 Detect latest LLVM release
+      # -------------------------------------------------------
+      # 3. CLANG — VERSI STABIL (anti rate-limit)
+      # -------------------------------------------------------
+      - name: Detect latest LLVM release
         id: get_llvm
         run: |
-          echo "🔎 Fetching latest LLVM release info..."
-          LLVM_TAG=$(curl -sL "https://api.github.com/repos/llvm/llvm-project/releases/latest" \
-                     | jq -r '.tag_name')
-          echo "LLVM_TAG=${LLVM_TAG}" >> $GITHUB_OUTPUT
-          echo "✅ Latest LLVM tag: ${LLVM_TAG}"
+          echo "Fetching latest LLVM tag..."
+          LLVM_TAG=$(curl -sL --max-time 30 "https://api.github.com/repos/llvm/llvm-project/releases/latest" \
+                     | jq -r '.tag_name // "llvmorg-17.0.6"')
+          if [ -z "$LLVM_TAG" ] || [ "$LLVM_TAG" = "null" ]; then
+            LLVM_TAG="llvmorg-17.0.6"
+          fi
+          LLVM_VER=$(echo "$LLVM_TAG" | sed 's/^llvmorg-//')
+          echo "LLVM_TAG=$LLVM_TAG" >> $GITHUB_OUTPUT
+          echo "LLVM_VER=$LLVM_VER" >> $GITHUB_OUTPUT
+          echo "Using LLVM: $LLVM_TAG"
 
-      - name: 📦 Download LLVM prebuilt
+      - name: Download LLVM prebuilt
         id: dl_llvm
         run: |
           LLVM_TAG="${{ steps.get_llvm.outputs.LLVM_TAG }}"
-          LLVM_VER=$(echo "${LLVM_TAG}" | sed 's/^llvmorg-//')
-          echo "📌 LLVM version detected: ${LLVM_VER}"
+          LLVM_VER="${{ steps.get_llvm.outputs.LLVM_VER }}"
           
-          LLVM_DIR="${TOOLCHAIN_DIR}/clang-${LLVM_VER}"
-          mkdir -p "${LLVM_DIR}"
+          mkdir -p ${{ env.TOOLCHAIN_DIR }}/clang
+          cd /tmp
           
-          # Coba beberapa mirror LLVM prebuilt
-          URL_BASE="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}"
-          for FILE in \
-            "clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-22.04.tar.xz" \
-            "clang+llvm-${LLVM_VER}-x86_64-linux-gnu.tar.xz" \
-            "clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-20.04.tar.xz"; do
-            echo "🌐 Trying: ${FILE}"
-            if curl -fsL --retry 3 -o /tmp/llvm.tar.xz "${URL_BASE}/${FILE}"; then
-              echo "✅ Downloaded: ${FILE}"
-              echo "LLVM_FILE=${FILE}" >> $GITHUB_OUTPUT
+          # Try multiple known good URLs
+          URLS=(
+            "https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+            "https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+            "https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/clang+llvm-${LLVM_VER}-x86_64-linux-gnu.tar.xz"
+          )
+          
+          DOWNLOADED=false
+          for URL in "${URLS[@]}"; do
+            echo "Trying: $URL"
+            if curl -fsSL --max-time 300 -o /tmp/llvm.tar.xz "$URL" 2>/dev/null; then
+              DOWNLOADED=true
+              echo "SUCCESS: $URL"
               break
             fi
           done
           
-          if [ ! -f /tmp/llvm.tar.xz ]; then
-            echo "❌ Failed to download any LLVM prebuilt"
-            exit 1
+          # Fallback ke versi yang terbukti stabil
+          if [ "$DOWNLOADED" = false ]; then
+            echo "Latest download failed, falling back to clang-r450784e..."
+            curl -fsSL --max-time 300 -o /tmp/llvm.tar.xz \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r450784e.tar.gz"
+            tar -xzf /tmp/llvm.tar.xz -C ${{ env.TOOLCHAIN_DIR }}/clang
+          else
+            tar -xJf /tmp/llvm.tar.xz -C ${{ env.TOOLCHAIN_DIR }}/clang --strip-components=1
           fi
           
-          tar -xJf /tmp/llvm.tar.xz -C "${LLVM_DIR}" --strip-components=1
           rm -f /tmp/llvm.tar.xz
-          echo "✅ LLVM installed at ${LLVM_DIR}"
-          "${LLVM_DIR}/bin/clang" --version | head -3
+          ${{ env.TOOLCHAIN_DIR }}/clang/bin/clang --version
 
-      # ============================================================
-      # 4. ANDROID CROSS COMPILER (GCC)
-      # ============================================================
-      - name: 📦 Install Android GCC cross-compiler
+      # -------------------------------------------------------
+      # 4. ANDROID GCC
+      # -------------------------------------------------------
+      - name: Install Android GCC
         run: |
-          mkdir -p ${TOOLCHAIN_DIR}/aarch64-linux-android-4.9
-          cd ${TOOLCHAIN_DIR}/aarch64-linux-android-4.9
-          
-          # Gunakan prebuilt GCC untuk android-5.10 (kompatibel 5.10 LTS)
+          mkdir -p ${{ env.TOOLCHAIN_DIR }}/aarch64-linux-android-4.9
+          cd ${{ env.TOOLCHAIN_DIR }}/aarch64-linux-android-4.9
           git clone --depth=1 -b android-5.10 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
-            .
-          echo "✅ aarch64-linux-android-4.9 ready"
-          
-          # ARM32 cross compiler (opsional, untuk kompatibilitas penuh)
-          mkdir -p ${TOOLCHAIN_DIR}/arm-linux-androideabi-4.9
-          cd ${TOOLCHAIN_DIR}/arm-linux-androideabi-4.9
-          git clone --depth=1 -b android-5.10 \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
-            .
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 .
 
-      # ============================================================
-      # 5. SETUP PATHS
-      # ============================================================
-      - name: 🛠️ Setup build environment
+      # -------------------------------------------------------
+      # 5. SETUP ENV
+      # -------------------------------------------------------
+      - name: Setup environment
         run: |
-          LLVM_DIR="${TOOLCHAIN_DIR}/clang-${{ steps.get_llvm.outputs.LLVM_TAG }}"
-          LLVM_DIR=$(echo "${LLVM_DIR}" | sed 's/^llvmorg-//')
+          CLANG_DIR="${{ env.TOOLCHAIN_DIR }}/clang"
+          GCC_DIR="${{ env.TOOLCHAIN_DIR }}/aarch64-linux-android-4.9"
           
-          cat > $GITHUB_WORKSPACE/env.sh <<EOF
-          export PATH="${LLVM_DIR}/bin:${TOOLCHAIN_DIR}/aarch64-linux-android-4.9/bin:${TOOLCHAIN_DIR}/arm-linux-androideabi-4.9/bin:\${PATH}"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-android-
-          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
-          export CC=clang
-          export CXX=clang++
-          export LD=ld.lld
-          export AR=llvm-ar
-          export NM=llvm-nm
-          export STRIP=llvm-strip
-          export OBJCOPY=llvm-objcopy
-          export OBJDUMP=llvm-objdump
-          export READELF=llvm-readelf
-          export HOSTCC=clang
-          export HOSTCXX=clang++
-          export HOSTAR=llvm-ar
-          export HOSTLD=ld.lld
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export LLVM=1
-          export LLVM_IAS=1
-          EOF
-          source $GITHUB_WORKSPACE/env.sh
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+          echo "GCC_DIR=$GCC_DIR" >> $GITHUB_ENV
+          echo "PATH=$CLANG_DIR/bin:$GCC_DIR/bin:$PATH" >> $GITHUB_ENV
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-androideabi-" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "HOSTCC=clang" >> $GITHUB_ENV
+          echo "HOSTCXX=clang++" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "LLVM=1" >> $GITHUB_ENV
+          echo "LLVM_IAS=1" >> $GITHUB_ENV
           
-          echo "=== Toolchain verification ==="
-          clang --version | head -2
-          ${CROSS_COMPILE}gcc --version | head -2
-          aarch64-linux-android-ld --version | head -1 || true
+          echo "=== Toolchain versions ==="
+          clang --version | head -1
+          ${CROSS_COMPILE}gcc --version 2>/dev/null | head -1 || aarch64-linux-android-gcc --version | head -1
 
-      # ============================================================
+      # -------------------------------------------------------
       # 6. CCACHE
-      # ============================================================
-      - name: ⚡ Setup ccache
+      # -------------------------------------------------------
+      - name: Setup ccache
         run: |
-          ccache --version
-          ccache -M ${CCACHE_MAXSIZE}
+          ccache -M 5G
           ccache -o compression=true
+          ccache --version
 
-      # ============================================================
-      # 7. APPLY: ReSukiSU
-      # ============================================================
-      - name: 🧩 Apply ReSukiSU patch
+      # -------------------------------------------------------
+      # 7. ReSukiSU
+      # -------------------------------------------------------
+      - name: Apply ReSukiSU
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "🔧 Applying ReSukiSU (branch: ${{ github.event.inputs.resukisu_branch || 'main' }})..."
+          echo "Applying ReSukiSU..."
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
             | bash -s "${{ github.event.inputs.resukisu_branch || 'main' }}"
-          echo "✅ ReSukiSU applied"
 
-      # ============================================================
-      # 8. APPLY: Susfs
-      # ============================================================
-      - name: 🛡️ Apply Susfs patch
+      # -------------------------------------------------------
+      # 8. Susfs
+      # -------------------------------------------------------
+      - name: Apply Susfs
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "🔧 Applying Susfs (branch: ${{ env.SUSFS_BRANCH:-${{ github.event.inputs.susfs_branch || 'gki-android12-5.10' }} }})..."
+          echo "Cloning Susfs..."
           git clone --depth=1 -b "${{ github.event.inputs.susfs_branch || 'gki-android12-5.10' }}" \
             https://gitlab.com/simonpunk/susfs4ksu.git susfs
+          
           cd susfs
-          cp -r fs/* ../fs/ 2>/dev/null || true
-          cp -r include/* ../include/ 2>/dev/null || true
-          # Apply kernel patches
-          if ls kernel_patches/*.patch 1> /dev/null 2>&1; then
-            for patch in kernel_patches/*.patch; do
-              echo "📌 Applying: $patch"
-              cd .. && git apply --check "susfs/$patch" 2>/dev/null \
-                && git apply "susfs/$patch" \
-                || echo "⚠️  Patch $patch may already be applied or conflicts"
-            done
+          # Copy fs dan include
+          if [ -d "fs" ]; then
+            cp -rn fs/* ../fs/ 2>/dev/null || true
           fi
+          if [ -d "include" ]; then
+            cp -rn include/* ../include/ 2>/dev/null || true
+          fi
+          
+          # Apply patches
           cd ..
-          echo "✅ Susfs applied"
+          for patch_dir in susfs/kernel_patches susfs/patches; do
+            if [ -d "$patch_dir" ]; then
+              for patch in $patch_dir/*.patch; do
+                [ -f "$patch" ] || continue
+                echo "Applying: $patch"
+                git apply --check "$patch" 2>/dev/null && git apply "$patch" || echo "  -> skipped (conflict/applied)"
+              done
+            fi
+          done
 
-      # ============================================================
-      # 9. APPLY: NoMount (dengan input custom commit)
-      # ============================================================
-      - name: 🪝 Apply NoMount
+      # -------------------------------------------------------
+      # 9. NoMount
+      # -------------------------------------------------------
+      - name: Apply NoMount
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           NOMOUNT_REF="${{ github.event.inputs.nomount_commit || 'master' }}"
-          echo "🔧 Applying NoMount (ref: ${NOMOUNT_REF})..."
+          echo "Applying NoMount (ref: $NOMOUNT_REF)..."
           
-          # Clone NoMount dengan ref yang ditentukan
-          git clone --depth=1 -b "${NOMOUNT_REF}" \
-            https://github.com/maxsteeel/nomount.git nomount 2>/dev/null \
-            || git clone https://github.com/maxsteeel/nomount.git nomount
-          
+          # Clone repo
+          git clone https://github.com/maxsteeel/nomount.git nomount
           cd nomount
-          # Checkout ref spesifik jika bukan default
-          if [ "${NOMOUNT_REF}" != "master" ] && [ "${NOMOUNT_REF}" != "main" ]; then
-            git fetch --depth=1 origin "${NOMOUNT_REF}" 2>/dev/null || true
-            git checkout "${NOMOUNT_REF}" 2>/dev/null || true
+          
+          # Checkout ref spesifik (commit/branch/tag)
+          if [ "$NOMOUNT_REF" != "master" ] && [ "$NOMOUNT_REF" != "main" ]; then
+            git fetch --depth=1 origin "$NOMOUNT_REF" 2>/dev/null || git fetch origin "$NOMOUNT_REF"
+            git checkout "$NOMOUNT_REF" 2>/dev/null || {
+              echo "Ref $NOMOUNT_REF not found, using default branch"
+            }
           fi
           
           cd ..
           
-          # Apply NoMount via official setup script (fallback)
+          # Run official setup script
           curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" \
             | bash -s master
-          
-          echo "✅ NoMount applied (ref: ${NOMOUNT_REF})"
 
-      # ============================================================
-      # 10. APPLY: Re-Kernel (Sakion netlink & ebpf)
-      # ============================================================
-      - name: 🔗 Apply Re-Kernel (Sakion)
+      # -------------------------------------------------------
+      # 10. Re-Kernel (Sakion)
+      # -------------------------------------------------------
+      - name: Apply Re-Kernel
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "🔧 Applying Re-Kernel (Sakion, branch: ${{ github.event.inputs.rekernel_branch || 'main' }})..."
+          echo "Cloning Re-Kernel..."
           git clone --depth=1 -b "${{ github.event.inputs.rekernel_branch || 'main' }}" \
             https://github.com/Sakion-Team/Re-Kernel.git re-kernel
           
-          # Cari dan apply semua patch yang relevan
-          if [ -d "re-kernel/patches" ]; then
-            for patch in re-kernel/patches/*.patch; do
-              [ -f "$patch" ] || continue
-              echo "📌 Applying: $patch"
-              git apply --check "$patch" 2>/dev/null \
-                && git apply "$patch" \
-                || echo "⚠️  Skip $patch (already applied / conflict)"
-            done
-          fi
-          
-          if [ -d "re-kernel/kernel_patches" ]; then
-            for patch in re-kernel/kernel_patches/*.patch; do
-              [ -f "$patch" ] || continue
-              echo "📌 Applying: $patch"
-              git apply --check "$patch" 2>/dev/null \
-                && git apply "$patch" \
-                || echo "⚠️  Skip $patch (already applied / conflict)"
-            done
-          fi
-          
-          # Copy module files jika ada
-          if [ -d "re-kernel/netlink" ]; then
-            mkdir -p net/sakion_netlink
-            cp -r re-kernel/netlink/* net/sakion_netlink/ 2>/dev/null || true
-          fi
-          if [ -d "re-kernel/ebpf" ]; then
-            mkdir -p kernel/sakion_ebpf
-            cp -r re-kernel/ebpf/* kernel/sakion_ebpf/ 2>/dev/null || true
-          fi
-          
-          echo "✅ Re-Kernel applied"
+          # Apply patches
+          for patch_dir in re-kernel/patches re-kernel/kernel_patches; do
+            if [ -d "$patch_dir" ]; then
+              for patch in $patch_dir/*.patch; do
+                [ -f "$patch" ] || continue
+                echo "Applying: $patch"
+                git apply --check "$patch" 2>/dev/null && git apply "$patch" || echo "  -> skipped"
+              done
+            fi
+          done
 
-      # ============================================================
-      # 11. DEFCONFIG SETUP
-      # ============================================================
-      - name: ⚙️ Generate defconfig
+      # -------------------------------------------------------
+      # 11. DEFCONFIG
+      # -------------------------------------------------------
+      - name: Generate defconfig
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          source $GITHUB_WORKSPACE/env.sh
-          
-          # Verifikasi defconfig ada
-          if [ ! -f "arch/arm64/configs/${DEFCONFIG}" ]; then
-            echo "❌ Defconfig ${DEFCONFIG} tidak ditemukan!"
-            echo "📋 Defconfigs yang tersedia:"
+          # Validasi defconfig
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG}"
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
+            echo "ERROR: Defconfig not found: $DEFCONFIG_PATH"
+            echo "Available defconfigs:"
             ls arch/arm64/configs/ | head -30
             exit 1
           fi
           
-          echo "📋 Using defconfig: ${DEFCONFIG}"
+          echo "Using defconfig: $DEFCONFIG"
           
-          # Enable ksu/susfs config jika ada
-          cat >> arch/arm64/configs/${DEFCONFIG} <<'KEOF'
-          # === ReSukiSU / KernelSU ===
+          # Tambah config flags untuk fitur kita
+          cat >> "$DEFCONFIG_PATH" <<'EOF'
+          # === KernelSU / ReSukiSU ===
           CONFIG_KSU=y
           CONFIG_KPM=y
-          CONFIG_KALLSYMS=y
           
           # === Susfs ===
           CONFIG_KSU_SUSFS=y
@@ -370,179 +313,142 @@ jobs:
           # === NoMount ===
           CONFIG_NOMOUNT=y
           
-          # === Re-Kernel ===
-          CONFIG_NETLINK_NETFILTER=y
+          # === Re-Kernel (Netlink & eBPF) ===
+          CONFIG_NETFILTER=y
           CONFIG_NETFILTER_NETLINK_QUEUE=y
+          CONFIG_NETLINK_NETFILTER=y
           CONFIG_BPF=y
           CONFIG_BPF_SYSCALL=y
           CONFIG_BPF_JIT=y
+          CONFIG_BPF_JIT_ALWAYS_ON=y
           CONFIG_HAVE_EBPF_JIT=y
-          KEOF
+          EOF
           
-          ${{ github.event.inputs.clean_build == 'true' && 'make clean && make mrproper &&' || '' }}
+          # Clean (opsional)
+          if [ "${{ github.event.inputs.clean_build }}" = "true" ]; then
+            make clean && make mrproper
+          fi
+          
+          # Generate .config
           make ${DEFCONFIG}
           
-          # Validasi
           if [ ! -f .config ]; then
-            echo "❌ .config tidak ter-generate!"
+            echo "ERROR: .config not generated"
             exit 1
           fi
-          echo "✅ Defconfig generated"
+          echo "Config generated OK"
 
-      # ============================================================
-      # 12. BUILD KERNEL
-      # ============================================================
-      - name: 🏗️ Build kernel image
+      # -------------------------------------------------------
+      # 12. BUILD
+      # -------------------------------------------------------
+      - name: Build kernel
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          source $GITHUB_WORKSPACE/env.sh
+          source $GITHUB_ENV
           
-          # Validasi toolchain
+          echo "=== Verifying toolchain ==="
+          which clang
           clang --version | head -1
-          ${CROSS_COMPILE}gcc --version | head -1
+          which ${CROSS_COMPILE}gcc || ls $GCC_DIR/bin/ | head -5
           
-          # Set ccache prefix
-          if command -v ccache >/dev/null 2>&1; then
-            export CC="ccache clang"
-            export CXX="ccache clang++"
-          fi
-          
-          # Build
-          echo "🚀 Starting kernel build..."
+          echo "=== Building kernel ==="
           make -j$(nproc) \
             CC="ccache clang" \
             CROSS_COMPILE="ccache ${CROSS_COMPILE}" \
-            CROSS_COMPILE_ARM32="ccache arm-linux-androideabi-" \
-            LLVM=1 \
-            2>&1 | tee build.log | grep -E "Image|^make|error:|warning:" || true
+            LLVM=1 2>&1 | tee build.log | tail -200
           
           BUILD_RESULT=${PIPESTATUS[0]}
           if [ $BUILD_RESULT -ne 0 ]; then
-            echo "❌ Build gagal! Tail dari build.log:"
-            tail -100 build.log
+            echo "BUILD FAILED"
             exit $BUILD_RESULT
           fi
-          echo "✅ Kernel build sukses"
+          echo "BUILD SUCCESS"
 
-      # ============================================================
-      # 13. VERIFY OUTPUT
-      # ============================================================
-      - name: ✅ Verify kernel image
+      # -------------------------------------------------------
+      # 13. VERIFY & COPY OUTPUT
+      # -------------------------------------------------------
+      - name: Verify output
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          echo "📦 Output files:"
           ls -lh arch/arm64/boot/
           
-          # Pilih image yang sesuai
+          # Copy semua output
+          mkdir -p ${{ github.workspace }}/out
+          
           if [ -f arch/arm64/boot/Image ]; then
-            cp arch/arm64/boot/Image ${GITHUB_WORKSPACE}/Image
-            echo "✅ Image: $(stat -c%s arch/arm64/boot/Image) bytes"
+            cp arch/arm64/boot/Image ${{ github.workspace }}/out/
           fi
-          
           if [ -f arch/arm64/boot/Image.gz-dtb ]; then
-            cp arch/arm64/boot/Image.gz-dtb ${GITHUB_WORKSPACE}/Image.gz-dtb
-            echo "✅ Image.gz-dtb: $(stat -c%s arch/arm64/boot/Image.gz-dtb) bytes"
+            cp arch/arm64/boot/Image.gz-dtb ${{ github.workspace }}/out/
           fi
-          
           if [ -f arch/arm64/boot/Image.gz ]; then
-            cp arch/arm64/boot/Image.gz ${GITHUB_WORKSPACE}/Image.gz
-            echo "✅ Image.gz: $(stat -c%s arch/arm64/boot/Image.gz) bytes"
+            cp arch/arm64/boot/Image.gz ${{ github.workspace }}/out/
           fi
           
-          # DTBs
+          # DTB
           if [ -d arch/arm64/boot/dts ]; then
-            mkdir -p ${GITHUB_WORKSPACE}/dtbs
-            find arch/arm64/boot/dts -name "*.dtb" -exec cp {} ${GITHUB_WORKSPACE}/dtbs/ \;
-            echo "✅ DTBs: $(ls ${GITHUB_WORKSPACE}/dtbs/ | wc -l) files"
+            mkdir -p ${{ github.workspace }}/out/dtb
+            find arch/arm64/boot/dts -name "*.dtb" -exec cp {} ${{ github.workspace }}/out/dtb/ \; 2>/dev/null || true
           fi
           
-          # Hitung SHA1
-          IMAGE_SHA1=$(sha1sum ${GITHUB_WORKSPACE}/Image.gz-dtb 2>/dev/null \
-            || sha1sum ${GITHUB_WORKSPACE}/Image 2>/dev/null \
-            || sha1sum ${GITHUB_WORKSPACE}/Image.gz 2>/dev/null \
-            | awk '{print $1}')
-          echo "IMAGE_SHA1=${IMAGE_SHA1}" >> $GITHUB_ENV
-          echo "🔐 SHA1: ${IMAGE_SHA1}"
+          # SHA1
+          for img in Image.gz-dtb Image.gz Image; do
+            if [ -f "${{ github.workspace }}/out/$img" ]; then
+              SHA1=$(sha1sum "${{ github.workspace }}/out/$img" | awk '{print $1}')
+              echo "IMAGE_SHA1=$SHA1" >> $GITHUB_ENV
+              echo "Selected: $img (SHA1: $SHA1)"
+              break
+            fi
+          done
+          
+          ls -lh ${{ github.workspace }}/out/
 
-      # ============================================================
-      # 14. PACKAGE AnyKernel3
-      # ============================================================
-      - name: 📦 Package AnyKernel3
-        if: ${{ github.event.inputs.upload_anykernel3 == 'true' }}
+      # -------------------------------------------------------
+      # 14. ANYKERNEL3
+      # -------------------------------------------------------
+      - name: Package AnyKernel3
         run: |
-          echo "📥 Cloning AnyKernel3..."
-          git clone --depth=1 https://github.com/yudharn/AnyKernel3.git ${GITHUB_WORKSPACE}/AnyKernel3
-          cd ${GITHUB_WORKSPACE}/AnyKernel3
+          git clone --depth=1 https://github.com/yudharn/AnyKernel3.git ${{ github.workspace }}/AnyKernel3
+          cd ${{ github.workspace }}/AnyKernel3
           
           # Set SHA1
-          sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" AnyKernel3/anykernel.sh
-          # Fallback jika struktur AnyKernel3 berbeda
-          sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" anykernel.sh 2>/dev/null || true
+          sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" anykernel.sh
+          sed -i "s/^SHA1_STOCK=\"0\"/SHA1_STOCK=\"${IMAGE_SHA1}\"/" AnyKernel3/anykernel.sh 2>/dev/null || true
           
-          # Copy kernel image
-          cd ${GITHUB_WORKSPACE}/AnyKernel3
-          if [ -f ${GITHUB_WORKSPACE}/Image.gz-dtb ]; then
-            cp ${GITHUB_WORKSPACE}/Image.gz-dtb zImage
-          elif [ -f ${GITHUB_WORKSPACE}/Image.gz ]; then
-            cp ${GITHUB_WORKSPACE}/Image.gz zImage
-          else
-            cp ${GITHUB_WORKSPACE}/Image zImage
-          fi
+          # Copy image
+          for img in Image.gz-dtb Image.gz Image; do
+            if [ -f "${{ github.workspace }}/out/$img" ]; then
+              cp "${{ github.workspace }}/out/$img" zImage
+              echo "Using: $img"
+              break
+            fi
+          done
           
           # Copy DTB
-          if [ -d ${GITHUB_WORKSPACE}/dtbs ]; then
-            cp -r ${GITHUB_WORKSPACE}/dtbs/* . 2>/dev/null || true
-            mkdir -p dtb
-            cp -r ${GITHUB_WORKSPACE}/dtbs/* dtb/ 2>/dev/null || true
+          if [ -d "${{ github.workspace }}/out/dtb" ]; then
+            cp -r ${{ github.workspace }}/out/dtb/* . 2>/dev/null || true
           fi
           
-          # Update anykernel.sh metadata
-          sed -i "s|kernel.string=.*|kernel.string=${KERNEL_NAME} for Poco F5 by @yudharn|" anykernel.sh 2>/dev/null || true
+          # Update metadata
+          sed -i "s|kernel.string=.*|kernel.string=${KERNEL_NAME} for Poco F5|" anykernel.sh 2>/dev/null || true
           sed -i "s|device.name1=.*|device.name1=marble|" anykernel.sh 2>/dev/null || true
           sed -i "s|device.name2=.*|device.name2=Poco F5|" anykernel.sh 2>/dev/null || true
           sed -i "s|device.name3=.*|device.name3=|" anykernel.sh 2>/dev/null || true
           
-          # Bersihkan .git
           rm -rf .git .github
           
-          # Zip
           ZIP_NAME="${KERNEL_NAME}-PocoF5-marble-$(date +%Y%m%d-%H%M).zip"
-          zip -r9 "${GITHUB_WORKSPACE}/${ZIP_NAME}" . -x "*.git*" "*.zip" "README.md"
-          
-          echo "✅ AnyKernel3 zip created: ${ZIP_NAME}"
-          ls -lh ${GITHUB_WORKSPACE}/${ZIP_NAME}
+          zip -r9 "${{ github.workspace }}/$ZIP_NAME" . -x "*.git*" "*.zip" "README.md"
+          cp "${{ github.workspace }}/$ZIP_NAME" ${{ github.workspace }}/out/
+          ls -lh ${{ github.workspace }}/out/
 
-      # ============================================================
-      # 15. UPLOAD ARTIFACTS
-      # ============================================================
-      - name: 📤 Upload kernel artifacts
+      # -------------------------------------------------------
+      # 15. UPLOAD
+      # -------------------------------------------------------
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kernel-marble-${{ env.KERNEL_NAME }}-${{ github.run_id }}
-          path: |
-            Image
-            Image.gz
-            Image.gz-dtb
-            dtbs/
-            *.zip
-          if-no-files-found: warn
+          path: ${{ github.workspace }}/out/
           retention-days: 14
-
-      # ============================================================
-      # 16. CLEANUP
-      # ============================================================
-      - name: 🧹 Show final summary
-        if: always()
-        run: |
-          echo "============================================"
-          echo "📊 BUILD SUMMARY"
-          echo "============================================"
-          echo "🔧 Kernel: ${KERNEL_NAME}"
-          echo "📱 Device: Poco F5 (marble)"
-          echo "⚙️ Defconfig: ${DEFCONFIG}"
-          echo "🧩 ReSukiSU: ${{ github.event.inputs.resukisu_branch || 'main' }}"
-          echo "🛡️ Susfs: ${{ github.event.inputs.susfs_branch || 'gki-android12-5.10' }}"
-          echo "🪝 NoMount: ${{ github.event.inputs.nomount_commit || 'master' }}"
-          echo "🔗 Re-Kernel: ${{ github.event.inputs.rekernel_branch || 'main' }}"
-          echo "🔐 SHA1: ${IMAGE_SHA1}"
-          echo "============================================"
+          if-no-files-found: warn
